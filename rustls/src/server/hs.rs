@@ -9,7 +9,8 @@ use super::server_conn::ServerConnectionData;
 #[cfg(feature = "tls12")]
 use super::tls12;
 use crate::common_state::{
-    KxState, Protocol, RawKeyNegotationResult, RawKeyNegotiationParams, State,
+    CertificateTypeExtensionNegotationResult, KxState,
+    Protocol, State,
 };
 use crate::conn::ConnectionRandoms;
 use crate::crypto::SupportedKxGroup;
@@ -213,22 +214,27 @@ impl ExtensionProcessing {
         config: &ServerConfig,
         cx: &mut ServerContext<'_>,
     ) -> Result<(), Error> {
-        let requires_server_rpk = config
+        let local_supports = if config
             .cert_resolver
-            .only_raw_public_keys();
-        let client_allows_rpk = hello
+            .only_raw_public_keys()
+        {
+            CertificateType::RawPublicKey
+        } else {
+            CertificateType::X509
+        };
+        let peer_supports = hello
             .server_certificate_extension()
-            .map(|certificate_types| certificate_types.contains(&CertificateType::RawPublicKey))
-            .unwrap_or(false);
+            .map(|certificate_types| certificate_types.to_vec())
+            .unwrap_or_default();
 
-        let raw_key_negotation_params = RawKeyNegotiationParams {
-            peer_supports_raw_key: client_allows_rpk,
-            local_expects_raw_key: requires_server_rpk,
+        let raw_key_negotation_params = NegotationCertificateTypeExtension {
+            peer_supports,
+            local_supports,
             extension_type: ExtensionType::ServerCertificateType,
         };
 
         self.process_cert_type_extension(
-            raw_key_negotation_params.validate_raw_key_negotiation(),
+            raw_key_negotation_params.validate_certificate_type_extension(),
             cx,
         )
     }
@@ -239,50 +245,51 @@ impl ExtensionProcessing {
         config: &ServerConfig,
         cx: &mut ServerContext<'_>,
     ) -> Result<(), Error> {
-        let requires_client_rpk = config
-            .verifier
-            .requires_raw_public_keys();
-        let client_offers_rpk = hello
+        let local_supports = if config.verifier.requires_raw_public_keys(){
+            CertificateType::RawPublicKey
+        } else {
+            CertificateType::X509
+        };
+        let peer_supports = hello
             .client_certificate_extension()
-            .map(|certificate_types| certificate_types.contains(&CertificateType::RawPublicKey))
-            .unwrap_or(false);
-
-        let raw_key_negotation_params = RawKeyNegotiationParams {
-            peer_supports_raw_key: client_offers_rpk,
-            local_expects_raw_key: requires_client_rpk,
+            .map(|certificate_types| certificate_types.to_vec())
+            .unwrap_or_default();
+        let raw_key_negotation_params = NegotationCertificateTypeExtension {
+            peer_supports,
+            local_supports,
             extension_type: ExtensionType::ClientCertificateType,
         };
         self.process_cert_type_extension(
-            raw_key_negotation_params.validate_raw_key_negotiation(),
+            raw_key_negotation_params.validate_certificate_type_extension(),
             cx,
         )
     }
 
     fn process_cert_type_extension(
         &mut self,
-        raw_key_negotiation_result: RawKeyNegotationResult,
+        raw_key_negotiation_result: CertificateTypeExtensionNegotationResult,
         cx: &mut ServerContext<'_>,
     ) -> Result<(), Error> {
         match raw_key_negotiation_result {
-            RawKeyNegotationResult::Negotiated(ExtensionType::ClientCertificateType) => {
+            CertificateTypeExtensionNegotationResult::Negotiated(ExtensionType::ClientCertificateType, cert_type) => {
                 self.exts
                     .push(ServerExtension::ClientCertType(
-                        CertificateType::RawPublicKey,
+                        cert_type
                     ));
             }
-            RawKeyNegotationResult::Negotiated(ExtensionType::ServerCertificateType) => {
+            CertificateTypeExtensionNegotationResult::Negotiated(ExtensionType::ServerCertificateType, cert_type) => {
                 self.exts
                     .push(ServerExtension::ServerCertType(
-                        CertificateType::RawPublicKey,
+                        cert_type
                     ));
             }
-            RawKeyNegotationResult::Err(err) => {
+            CertificateTypeExtensionNegotationResult::Err(err) => {
                 return Err(cx
                     .common
                     .send_fatal_alert(AlertDescription::HandshakeFailure, err));
             }
-            RawKeyNegotationResult::NotNegotiated => {}
-            RawKeyNegotationResult::Negotiated(_) => unreachable!(
+            CertificateTypeExtensionNegotationResult::NotNegotiated => {}
+            CertificateTypeExtensionNegotationResult::Negotiated(_, _) => unreachable!(
                 "The extension type should only ever be ClientCertificateType or ServerCertificateType"
             ),
         }
@@ -734,4 +741,34 @@ pub(super) fn process_client_hello<'m>(
 pub(crate) enum HandshakeHashOrBuffer {
     Buffer(HandshakeHashBuffer),
     Hash(HandshakeHash),
+}
+
+#[derive(Debug)]
+struct NegotationCertificateTypeExtension {
+    peer_supports: Vec<CertificateType>,
+    local_supports: CertificateType,
+    extension_type: ExtensionType,
+}
+
+impl NegotationCertificateTypeExtension {
+    fn validate_certificate_type_extension(
+        &self,
+    ) -> CertificateTypeExtensionNegotationResult {
+        // TODO WHAT IS MORE CLEAR? THE MATCH OR THE IF ELSE?
+        if self
+            .peer_supports
+            .contains(&self.local_supports)
+        {
+            CertificateTypeExtensionNegotationResult::Negotiated(
+                self.extension_type,
+                self.local_supports,
+            )
+        } else if self.local_supports == CertificateType::X509 && self.peer_supports.is_empty() {
+            CertificateTypeExtensionNegotationResult::NotNegotiated
+        } else {
+            CertificateTypeExtensionNegotationResult::Err(Error::PeerIncompatible(
+                PeerIncompatible::IncorrectCertificateTypeExtension,
+            ))
+        }
+    }
 }
